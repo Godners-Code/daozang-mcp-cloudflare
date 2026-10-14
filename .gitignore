@@ -1,0 +1,18 @@
+node_modules/
+.wrangler/
+.tmp/
+*.log
+
+# Never commit credentials.
+.cf-token
+.env
+.env.*
+.dev.vars
+
+# The markdown corpus (~190 MB) is uploaded as a Workers Asset, not committed.
+# The public/ dir itself must exist for [assets]; only its payload is ignored.
+public/markdowns/*
+!public/markdowns/.gitkeep
+dist/
+__pycache__/
+*.pyc

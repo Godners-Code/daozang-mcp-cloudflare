@@ -1,0 +1,49 @@
+name = "daozang-mcp"
+main = "src/index.ts"
+compatibility_date = "2026-10-13"
+
+# Primary endpoint: https://daozang.godners.top/mcp
+# Wrangler creates the DNS record + SSL certificate automatically on deploy.
+routes = [
+  { pattern = "daozang.godners.top", custom_domain = true }
+]
+
+# Keep workers.dev enabled as a fallback entry point.
+# Without this, adding a custom domain silently DISABLES workers.dev
+# (wrangler warns: "Because 'workers_dev' is not in your Wrangler file, it will
+# be disabled"), which would leave the service unreachable while the custom
+# domain's SSL certificate is still pending.
+workers_dev = true
+
+[[durable_objects.bindings]]
+name = "DAOZANG_DO"
+class_name = "DaozangIndex"
+
+# NOTE: do NOT rename this class or change instance names via idFromName().
+# The existing instances (shard-0..5) already hold the full 285,117-row corpus.
+# A rename creates brand-new empty instances and would force a full re-import
+# (285k rows) against the DO free-tier limit of 100k rows written/day.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["DaozangIndex"]
+
+# Replace with your own namespace id:
+#   npx wrangler kv namespace create daozang-kv
+[[kv_namespaces]]
+binding = "DAOZANG_KV"
+id = "cad1a93389c542289f7d5eea3671dd81"
+
+# Original markdown corpus (3,152 files, ~190 MB), served for get_original/read_source.
+# Create ./public/markdowns and drop the .md files in before deploying.
+[assets]
+directory = "./public"
+binding = "ASSETS"
+
+# DO NOT commit a real token. Use a secret instead:
+#   npx wrangler secret put ADMIN_TOKEN
+# Until one is set, /admin/* returns 401 and the MCP endpoint stays fully usable.
+[vars]
+ADMIN_TOKEN = ""
+
+[observability]
+enabled = true

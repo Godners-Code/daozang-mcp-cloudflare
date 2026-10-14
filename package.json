@@ -1,0 +1,16 @@
+{
+  "name": "daozang-mcp-cf",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "dependencies": {
+    "hono": "^4.6.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261013.0",
+    "wrangler": "^4"
+  }
+}
