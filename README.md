@@ -44,18 +44,17 @@ curl -X POST https://daozang.godners.top/mcp \
 │  /VS Code…)   │                          └──────┬───────────┬───────────┘
 └──────────────┘                                 │           │
                                                  │           │
-              ┌──────────────────────────────────┘           └──────────────┐
-              ▼                                                             ▼
-  ┌───────────────────────────────┐                        ┌────────────────────────┐
-  │ Durable Objects × 6 (SQLite)  │                        │ Workers Assets          │
-  │  class DaozangIndex           │                        │  public/markdowns/      │
-  │  shard-0 … shard-5            │                        │  3,152 篇原文 (190 MB)  │
-  │  FTS5 全文索引 + BM25         │                        └────────────────────────┘
-  │  ~285k 行 / 1,024 MB          │
-  └───────────────────────────────┘                        ┌────────────────────────┐
-                                                           │ Workers KV (1 key)      │
-                                                           │  "sources" 经文目录索引  │
-                                                           └────────────────────────┘
+              ┌───────────────┬───────────────────────────────┴───────────────┐
+              ▼               ▼                                               ▼
+  ┌───────────────────────────────┐   ┌──────────────────────┐   ┌────────────────────────┐
+  │ Durable Objects × 6 (SQLite)  │   │ AI Search            │   │ Workers Assets          │
+  │  class DaozangIndex           │   │  daozang-aisearch    │   │  public/markdowns/      │
+  │  shard-0 … shard-5            │   │  bge-m3 语义向量      │   │  3,152 篇原文 (190 MB)  │
+  │  FTS5 全文索引 + BM25         │   │  3,152 篇标题+开篇    │   └────────────────────────┘
+  │  ~285k 行 / 1,024 MB          │   └──────────────────────┘   ┌────────────────────────┐
+  └───────────────────────────────┘                               │ Workers KV (1 key)      │
+                                                                  │  "sources" 经文目录索引  │
+                                                                  └────────────────────────┘
 ```
 
 **为什么是这套组合**
@@ -63,6 +62,7 @@ curl -X POST https://daozang.godners.top/mcp \
 | 组件 | 承担的职责 | 选型理由 |
 |---|---|---|
 | **Durable Objects** | 全文索引与查询 | SQLite 后端支持 FTS5；查询不计 CPU（免费层只有 10ms/请求，若用纯 Worker 内存/CPU 都不够）；1 GB/Object 存储 |
+| **AI Search** | 语义检索 | 托管 RAG，内置存储无需自建 R2；bge-m3 中文向量 + 关键词混合。因 5M tokens/月额度限制，只索引每篇的标题+开篇摘要 |
 | **Workers Assets** | 原文 Markdown | 190 MB 语料静态托管；免费层 20,000 文件 × 25 MiB 足够；不走 KV 以避开写入配额 |
 | **Workers KV** | 经文目录索引 | 只存 1 个 key（288 KB），全生命周期仅 1 次写入，绕开 1,000 次/天配额 |
 
@@ -83,12 +83,13 @@ curl -X POST https://daozang.godners.top/mcp \
 
 ---
 
-## 三、六个工具
+## 三、七个工具
 
 | 工具 | 作用 | 关键参数 |
 |---|---|---|
 | `daozang_protocol` | 取考据方法论（**先用这个**） | — |
-| `daozang_status` | 馆藏状态：块数 / 篇数 / 分片规模 | — |
+| `daozang_status` | 馆藏状态：块数 / 篇数 / 分片 / 语义可用性 | — |
+| `search_semantic` | 语义检索（bge-m3 + 混合） | `query`, `top_k` |
 | `list_sources` | 按经名关键词列经目 | `keyword`, `limit` |
 | `search_daozang` | 全文检索（FTS5 + BM25） | `query`, `top_k`, `source_filter` |
 | `get_original` | 取带行号原文 + `⟦命中⟧` 标记 | `source`, `chunk_index`, `context` |
@@ -99,17 +100,25 @@ curl -X POST https://daozang.godners.top/mcp \
 ```
 1. daozang_protocol   读方法论
 2. list_sources       用「清静」「悟真」等关键词缩小到某几部经
-3. search_daozang     检索命中块（用原句短语，不要用问句）
-4. get_original       还原带行号原文，⟦…⟧ 标出命中范围 ← 引用前必用
-5. read_source        需要通读时取全文
+3. search_semantic    概念性/自然语言提问，先找是哪部经（语义）
+4. search_daozang     原句短语检索命中块（全文）
+5. get_original       还原带行号原文，⟦…⟧ 标出命中范围 ← 引用前必用
+6. read_source        需要通读时取全文
 ```
 
 ### 检索要点
 
+#### FTS5（search_daozang）
 - ✅ 好用：专名 / 原句短语 —— 「周天火候」「天地悉皆归」「黄庭」「无为」
 - ❌ 不好用：自然语言长问句 —— 「什么是内丹修炼中的周天火候？」（请自行切出术语）
 - 支持 **2 字**短词。中文采用**分字索引**（每个 CJK 字符两侧加空格后交给 `unicode61`），
   这是刻意选择 —— SQLite 的 `trigram` tokenizer 对 2 字查询失效，对中文术语是致命的。
+
+#### 语义检索（search_semantic）
+- ✅ 好用：自然语言概念 —— 「怎样炼内丹」「斋醮科仪」「山中辟谷服气」
+- ❌ 不好用：精确原句比对（BM25 更适合）
+- 范围：3,152 篇经文的**标题与开篇摘要**（每篇 2 个文本块），不含全文
+- ⚠️ **免费层每月仅 1,000 次语义查询额度**，命中后仍需回到 `search_daozang` + `get_original` 取证
 
 实测样例：
 
@@ -203,8 +212,12 @@ CF_WORKER=https://<your-worker>.workers.dev CF_ADMIN_TOKEN=<token> \
 | KV 存储 | 1 GB | 288 KB | ✅ |
 | Workers 请求 | 100,000/天 | — | ✅ |
 | Assets | 20,000 文件 × 25 MiB | 3,152 文件 / 190 MB | ✅ |
+| AI Search 索引文件 | 100,000/实例 | 3,152 | ✅ |
+| AI Search 摄入 tokens | **5,000,000/月** | 2,573,289（标题+开篇 2 块/篇） | ⚠️ 51.5%，余量充裕 |
+| AI Search 语义查询 | **1,000/月** | — | ⚠️ 使用时须节制 |
+| AI Search 全文查询 | **1,000/月** | — | ⚠️ 使用时须节制 |
 
-**三个必须知道的坑**
+**四个必须知道的坑**
 
 1. **DO 写入配额耗尽后，读仍正常。**
    `ensure()`（`CREATE TABLE IF NOT EXISTS`）用 try/catch 包裹，配额打满时不会让查询一起挂掉。
@@ -216,6 +229,10 @@ CF_WORKER=https://<your-worker>.workers.dev CF_ADMIN_TOKEN=<token> \
 
 3. **DO 实例无法真正删除。**
    `DELETE .../objects/{id}` 返回 `405`。只能 `storage.deleteAll()` 清空数据，实例 ID 会残留（靠系统 GC）。
+
+4. **AI Search 不存全文，只存标题+开篇。**
+   受 5M tokens/月额度限制，3,152 篇全量约 90M tokens（18×预算），不可行。
+   语义检索仅用于「找是哪部经」的发现层，精确取证仍需 `search_daozang` + `get_original`。
 
 ---
 
@@ -235,15 +252,16 @@ CF_WORKER=https://<your-worker>.workers.dev CF_ADMIN_TOKEN=<token> \
 
 ```
 .
-├── README.md              本文件
-├── DEPLOY.md              部署与数据导入
-├── USAGE.md               使用与客户端配置
-├── wrangler.toml          Worker 配置（DO / KV / Assets / 路由）
-├── src/index.ts           Worker + DO + MCP 实现（单文件）
-├── tools/ingest_cf.py     分片索引导入（支持 --shards 多日分批）
-├── tools/put_sources.py   经文目录索引写入 KV
-├── deploy.sh              部署脚本（走 wrangler deploy，不经 GitHub）
-└── public/markdowns/      原文语料（不入库，作为 Assets 上传）
+├── README.md                本文件
+├── DEPLOY.md                部署与数据导入（含 DO + AI Search）
+├── USAGE.md                 使用与客户端配置
+├── wrangler.toml            Worker 配置（DO / KV / Assets / AI / 路由）
+├── src/index.ts             Worker + DO + MCP 实现（单文件）
+├── tools/ingest_cf.py       分片索引导入（支持 --shards 多日分批）
+├── tools/put_sources.py     经文目录索引写入 KV
+├── tools/aisearch_import.py AI Search 语义索引导入（标题+开篇摘要）
+├── deploy.sh                部署脚本（走 wrangler deploy，不经 GitHub）
+└── public/markdowns/        原文语料（不入库，作为 Assets 上传）
 ```
 
 ---

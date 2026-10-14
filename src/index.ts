@@ -4,7 +4,9 @@ export interface Env {
   DAOZANG_DO: DurableObjectNamespace;
   DAOZANG_KV: KVNamespace;
   ASSETS: Fetcher;
+  AI?: Ai;
   ADMIN_TOKEN?: string;
+  AI_SEARCH_INSTANCE?: string;
 }
 
 /** Full corpus is ~1.06 GB, above the 1 GB/Object free limit, so split across shards. */
@@ -13,6 +15,10 @@ const SERVER_NAME = "daozang-reasoner";
 const SERVER_VERSION = "1.2.0";
 const TOTAL_CHUNKS = 285117;
 const TOTAL_FILES = 3152;
+
+/** AI Search holds ONE compact doc per scripture (title + opening), not the full corpus:
+ *  the free tier allows 5M ingestion tokens/month and the full corpus needs ~90M. */
+const AI_SEARCH_N_DOCS = 3152;
 
 const CJK = /[㐀-䶿一-鿿豈-﫿]/g;
 
@@ -358,7 +364,11 @@ const INSTRUCTIONS = `道藏考据（DaoZang Reasoner，Cloudflare 版）—— 
 2. list_sources      用关键词把范围缩到某几部经；
 3. search_daozang    检索命中块（返回相关度、源文件、块序号）；
 4. get_original      把命中块还原成带行号的 Markdown 原文，用 ⟦…⟧ 标出精确命中范围；
-5. read_source       需要通读时取全文。`;
+5. read_source       需要通读时取全文。
+
+另有一路语义检索 search_semantic（AI Search / bge-m3），覆盖每篇经文的标题与开篇摘要，
+适合「不知经名、只有概念」的查找；但它每月只有 1,000 次额度，且不含全文，
+命中后仍需回到 search_daozang + get_original 取证。`;
 
 const TOOLS = [
   {
@@ -374,6 +384,23 @@ const TOOLS = [
     description: "查看索引状态：块数、篇数、分片规模、可用引擎。",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: "search_semantic",
+    title: "语义检索（AI Search）",
+    description:
+      "按语义相似度检索（bge-m3 向量 + 关键词混合）。用自然语言提问或概念性查找时用它；" +
+      "命中后建议再用 search_daozang + get_original 回到全文中取证。注意：免费层每月仅 1,000 次语义查询。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "自然语言问题或概念描述，如「如何炼内丹」「讲斋醮科仪的经文」", minLength: 1 },
+        top_k: { type: "integer", description: "返回条数", minimum: 1, maximum: 20, default: 5 },
+      },
+      required: ["query"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
   {
     name: "list_sources",
@@ -482,6 +509,57 @@ async function fetchMarkdown(env: Env, source: string): Promise<string | null> {
   }
 }
 
+/** AI Search doc layout is "# title\n\n源文件：<source>\n\n<body>". Recover the source. */
+function parseSemanticHit(text: string) {
+  const m = /源文件：([^\n]+)/.exec(text ?? "");
+  const t = /^#\s*([^\n]+)/m.exec(text ?? "");
+  return { source: m ? m[1].trim() : "", title: t ? t[1].trim() : "" };
+}
+
+async function semanticSearch(env: Env, query: string, topK: number) {
+  const instance = env.AI_SEARCH_INSTANCE || "";
+  if (!env.AI) {
+    return { query, engine: "ai-search", available: false, count: 0, hits: [], note: "未绑定 Workers AI（[ai] binding），语义检索不可用" };
+  }
+  if (!instance) {
+    return { query, engine: "ai-search", available: false, count: 0, hits: [], note: "未配置 AI_SEARCH_INSTANCE" };
+  }
+  try {
+    // Workers binding -> { data: [{ filename, score, content: [{ text }] }] }
+    // REST API        -> { chunks: [{ score, text, item: { key } }] }
+    type Part = { text?: string };
+    type Hit = {
+      score?: number; filename?: string; text?: string;
+      content?: Part[]; item?: { key?: string };
+    };
+    const rag = env.AI.autorag(instance) as unknown as {
+      search: (o: Record<string, unknown>) => Promise<{ data?: Hit[]; chunks?: Hit[] }>;
+    };
+    const res = await rag.search({ query, max_num_results: topK, score_threshold: 0.3 });
+    const raw = res?.data ?? res?.chunks ?? [];
+    const hits = raw.map((d) => {
+      const full = Array.isArray(d.content)
+        ? d.content.map((c) => c?.text ?? "").join("\n")
+        : (d.text ?? "");
+      const { source, title } = parseSemanticHit(full);
+      const body = full.replace(/^#\s*[^\n]*\n+/, "").replace(/源文件：[^\n]*\n+/, "").trim();
+      return {
+        score: +Number(d.score ?? 0).toFixed(4),
+        source: source || d.filename || d.item?.key || "",
+        title,
+        key: d.filename || d.item?.key || "",
+        text: body,
+      };
+    });
+    return { query, engine: "ai-search-bge-m3", available: true, count: hits.length, hits, monthly_quota: "1,000 语义查询/月（免费层）" };
+  } catch (e) {
+    return {
+      query, engine: "ai-search", available: false, count: 0, hits: [],
+      note: `语义检索失败（可能已用尽当月 1,000 次额度）：${String(e).slice(0, 200)}`,
+    };
+  }
+}
+
 async function callTool(env: Env, name: string, args: Record<string, unknown>) {
   if (name === "daozang_protocol") return { methodology: METHODOLOGY };
 
@@ -492,10 +570,16 @@ async function callTool(env: Env, name: string, args: Record<string, unknown>) {
       n_chunks: res.reduce((a, r) => a + r.rows, 0),
       n_files: TOTAL_FILES,
       engine: "fts5-bm25",
-      semantic_available: false,
+      semantic_available: Boolean(env.AI && env.AI_SEARCH_INSTANCE),
+      semantic_instance: env.AI_SEARCH_INSTANCE || null,
+      semantic_docs: AI_SEARCH_N_DOCS,
       shards: res.map((r, i) => ({ shard: i, rows: r.rows, mb: r.dbSizeMB })),
       total_mb: +res.reduce((a, r) => a + r.dbSizeMB, 0).toFixed(2),
     };
+  }
+
+  if (name === "search_semantic") {
+    return await semanticSearch(env, String(args.query ?? ""), Number(args.top_k ?? 5));
   }
 
   if (name === "list_sources") {
@@ -650,6 +734,29 @@ export default {
       for (let i = 0; i < SHARDS; i++) names.push(`daozang-dons-${String(i + 1).padStart(2, "0")}`);
       const out = names.map((n) => ({ name: n, id: env.DAOZANG_DO.idFromName(n).toString() }));
       return Response.json({ shards: SHARDS, mapping: out });
+    }
+
+    /** Dump the raw AI Search binding response shape (temporary debugging aid). */
+    if (path === "/admin/ai-debug") {
+      const q = url.searchParams.get("q") ?? "内丹";
+      if (!env.AI) return Response.json({ error: "no AI binding" }, { status: 500 });
+      try {
+        const rag = env.AI.autorag(env.AI_SEARCH_INSTANCE || "daozang-aisearch") as unknown as {
+          search: (o: Record<string, unknown>) => Promise<unknown>;
+        };
+        const res: Record<string, unknown> = (await rag.search({
+          query: q, max_num_results: 2, score_threshold: 0.3,
+        })) as Record<string, unknown>;
+        const arr = ((res?.chunks ?? res?.data ?? []) as Record<string, unknown>[]) ?? [];
+        return Response.json({
+          topKeys: Object.keys(res ?? {}),
+          nHits: arr.length,
+          firstHitKeys: arr[0] ? Object.keys(arr[0]) : [],
+          firstHit: arr[0] ?? null,
+        });
+      } catch (e) {
+        return Response.json({ error: String(e).slice(0, 400) });
+      }
     }
 
     if (path === "/admin/clear-probe" && request.method === "POST") {

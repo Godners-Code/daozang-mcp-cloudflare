@@ -27,12 +27,13 @@ curl -X POST https://daozang.godners.top/mcp \
 
 ---
 
-## 二、六个工具
+## 二、七个工具
 
 | 工具 | 作用 | 参数 |
 |---|---|---|
 | `daozang_protocol` | 取考据方法论 | 无 |
 | `daozang_status` | 馆藏状态 | 无 |
+| `search_semantic` | 语义检索（bge-m3 + 混合） | `query`(必填), `top_k`(1–20, 默认 5) |
 | `list_sources` | 按经名关键词列经目 | `keyword`, `limit`(1–500, 默认 50) |
 | `search_daozang` | 全文检索 | `query`(必填), `top_k`(1–50, 默认 5), `source_filter`, `context` |
 | `get_original` | 带行号原文 + `⟦命中⟧` | `source`(必填), `chunk_index`(必填), `context` |
@@ -43,17 +44,25 @@ curl -X POST https://daozang.godners.top/mcp \
 ```
 1. daozang_protocol   读方法论
 2. list_sources       用「清静」「悟真」缩小到某几部经
-3. search_daozang     检索命中块（用原句短语，不要用问句）
-4. get_original       还原带行号原文，⟦…⟧ 标出命中范围 ← 引用前必用
-5. read_source        需要通读时取全文
+3. search_semantic    概念性/自然语言提问，先找是哪部经（语义）
+4. search_daozang     检索命中块（用原句短语，不要用问句）
+5. get_original       还原带行号原文，⟦…⟧ 标出命中范围 ← 引用前必用
+6. read_source        需要通读时取全文
 ```
 
 ### 2.2 检索要点
 
+#### FTS5（search_daozang）
 - ✅ 好用：专名 / 原句短语 —— 「周天火候」「天地悉皆归」「黄庭」「无为」
 - ❌ 不好用：自然语言长问句 —— 「什么是内丹修炼中的周天火候？」（自行切出术语）
 - 支持 **2 字**短词（分字索引方案），实测「无为」「黄庭」精准命中
 - 检索返回的是**清洗过的正文**，引用前一律用 `get_original` 回原文取证
+
+#### 语义检索（search_semantic）
+- ✅ 好用：概念/自然语言 —— 「怎样炼内丹」「斋醮科仪」「山中辟谷服气」
+- ❌ 不好用：精确原句比对（BM25 更适合）
+- 范围：3,152 篇经文的**标题与开篇摘要**，不含全文
+- ⚠️ **免费层每月仅 1,000 次语义查询额度**，命中后仍需回到 `search_daozang` + `get_original` 取证
 
 ### 2.3 调用示例
 
@@ -86,6 +95,38 @@ curl -X POST https://daozang.godners.top/mcp \
 ```
 
 > `score` 是 BM25 分值，**越小越相关**（负值）。
+
+**语义检索**
+
+```json
+{
+  "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+  "params": {
+    "name": "search_semantic",
+    "arguments": { "query": "斋醮科仪 设坛 上章", "top_k": 3 }
+  }
+}
+```
+
+返回：
+
+```json
+{
+  "query": "斋醮科仪 设坛 上章",
+  "engine": "ai-search-bge-m3",
+  "available": true,
+  "count": 3,
+  "hits": [
+    { "score": 0.5284, "source": "中华道藏-三洞真经-洞玄灵宝经-洞玄灵宝斋说光烛戒罚灯祝愿仪.md",
+      "title": "…", "text": "洞玄灵宝斋说光烛戒罚灯祝愿仪 > 经名：…" },
+    { "score": 0.5188, "source": "中华道藏-三洞真经-洞玄灵宝经-太上洞玄灵宝二部传授仪.md",
+      "text": "太上洞玄灵宝二部传授仪 > 经名：…" }
+  ],
+  "monthly_quota": "1,000 语义查询/月（免费层）"
+}
+```
+
+> `score` 是混合分数，**越大越相关**（正值）。命中后请用 `source` 字段继续用 `search_daozang` + `get_original` 取证。
 
 **原文取证**
 
@@ -264,6 +305,8 @@ npx -y mcp-remote https://daozang.godners.top/mcp
 | DO 存储 | 1 GB/实例 · 5 GB/账号 | 1,023.84 MB | ⚠️ 贴近上限，勿再加数据 |
 | KV 写入 | 1,000 次/天 | `sources` 仅 **1 次** | ✅ |
 | Workers 请求 | 100,000/天 | — | ✅ |
+| AI Search 摄入 tokens | 5,000,000/月 | 2,573,289（标题+开篇 2 块/篇） | ⚠️ 51.5%，余量充裕 |
+| AI Search 语义查询 | **1,000/月** | — | ⚠️ 使用时须节制 |
 
 ### 4.2 分片现状
 
@@ -323,3 +366,14 @@ A：① 换更短的核心词（2 字词是支持的）；② 去掉 `source_fil
 **Q：自定义域名被 Cloudflare 挑战页拦住？**
 A：关闭 Bot Fight Mode：Dashboard → 域名 → Security → Bots → Off。详见 DEPLOY.md。
 临时可改用备用端点 `daozang-mcp.godners.workers.dev`。
+
+**Q：语义检索 `search_semantic` 为什么返回空？**
+A：语义检索范围是每篇的**标题+开篇摘要**（不含全文），适合概念性提问，不适合精确原句。
+如果零命中，先放宽问题，再用 `search_daozang` 做全文精确检索。
+
+**Q：语义检索额度用完了怎么办？**
+A：免费层 1,000 次/月，用尽后该工具会返回错误。
+可以：① 等次月重置；② 直接只用 `search_daozang`（FTS5 不消耗 AI Search 额度）。
+
+**Q：为什么不把全文也放进 AI Search？**
+A：全量 190 MB 约 90M tokens，而免费层月额度仅 5M（18×），不可行。

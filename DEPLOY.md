@@ -80,6 +80,32 @@ cp -r /path/to/markdowns/*.md public/markdowns/
 # 或建立软链：ln -s /path/to/markdowns public/markdowns
 ```
 
+### 2.5 创建 AI Search 实例（语义检索）
+
+```bash
+# Token 需具备 AI Search:Edit + AI Search:Run 权限
+npx wrangler ai search instance create daozang-aisearch
+```
+
+然后配置：
+
+```bash
+curl -X PUT "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/ai-search/instances/daozang-aisearch" \
+  -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "enable": true,
+    "embedding_model": "@cf/baai/bge-m3",
+    "index_method": { "vector": true, "keyword": true },
+    "hybrid_search_enabled": true,
+    "chunk": true,
+    "chunk_size": 1024,
+    "score_threshold": 0.3
+  }'
+```
+
+无需自建 R2 或 Vectorize，AI Search 内置存储会直接托管文件。
+
 `wrangler.toml` 中已配置：
 
 ```toml
@@ -220,6 +246,24 @@ python tools/ingest_cf.py --max-rows 95000
 - **Python `requests` 经代理并发会持续 502**：导入脚本改用 `subprocess` 调 `curl`，
   单请求稳定，带 4 次重试。
 
+### 4.4 导入语义索引（AI Search）
+
+**预算**：免费层 5,000,000 tokens/月。全量 190 MB 约 90M tokens（18×），不可行；
+所以每篇只上传**标题 + 开篇 2 个文本块**（~2.57M tokens = 51.5%）。
+
+```bash
+export CLOUDFLARE_API_TOKEN=...
+export CLOUDFLARE_ACCOUNT_ID=...
+python tools/aisearch_import.py --build --upload \
+  --data-dir ./data \
+  --out ./aisearch_docs \
+  --chunks-per-doc 2 \
+  --instance daozang-aisearch
+```
+
+脚本会先用 tiktoken 核算 token 消耗（cl100k_base），若超出 5M 会拒绝并退出。
+上传后可在 Dashboard → AI → AI Search → daozang-aisearch 查看索引状态。
+
 ---
 
 ## 五、验证
@@ -242,6 +286,7 @@ curl -H "x-admin-token: $T" https://<worker>/admin/diag
 | `/admin/reset` | 清空所有分片 —— **危险** |
 | `/admin/clear-probe` | 删除测试探针行 |
 | `/admin/put-sources` | 写入 KV 目录索引 |
+| `/admin/ai-debug?q=` | 查看 AI Search 原始响应结构 |
 
 期望的 `/admin/stats`：
 
@@ -269,12 +314,13 @@ curl -X POST https://<worker>/mcp -H "Content-Type: application/json" \
 
 ### 5.3 验收清单
 
-- [ ] `tools/list` 返回 6 个工具
-- [ ] `daozang_status` 的 `n_chunks` = 285,117、`n_files` = 3,152
+- [ ] `tools/list` 返回 7 个工具
+- [ ] `daozang_status` 的 `n_chunks` = 285,117、`n_files` = 3,152、`semantic_available`=true
 - [ ] `list_sources` 用「清静」能匹配到约 24 篇
 - [ ] `search_daozang` 用 2 字词（「无为」「黄庭」）能命中
 - [ ] `get_original` 返回 `located: true` 且带行号与 `⟦⟧` 标记
 - [ ] `read_source` 能取到全文
+- [ ] `search_semantic` 用「内丹修炼」能命中《太上内丹守一真定经》等
 
 ---
 

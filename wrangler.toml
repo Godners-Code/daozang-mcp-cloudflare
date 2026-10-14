@@ -39,11 +39,17 @@ id = "cad1a93389c542289f7d5eea3671dd81"
 directory = "./public"
 binding = "ASSETS"
 
+# Semantic retrieval — Cloudflare AI Search instance "daozang-aisearch".
+# Comment out this block and AI_SEARCH_INSTANCE below to drop search_semantic.
+[ai]
+binding = "AI"
+
 # DO NOT commit a real token. Use a secret instead:
 #   npx wrangler secret put ADMIN_TOKEN
 # Until one is set, /admin/* returns 401 and the MCP endpoint stays fully usable.
 [vars]
 ADMIN_TOKEN = ""
+AI_SEARCH_INSTANCE = "daozang-aisearch"
 
 [observability]
 enabled = true
